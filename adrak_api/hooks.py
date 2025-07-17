@@ -165,6 +165,13 @@ app_license = "mit"
 # 		"adrak_api.tasks.monthly"
 # 	],
 # }
+scheduler_events = {
+    "cron": {
+        "*/2 * * * *": [
+            "adrak_api.api.import_sales_invoices"
+        ]
+    }
+}
 
 # Testing
 # -------
