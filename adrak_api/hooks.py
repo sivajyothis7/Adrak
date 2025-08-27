@@ -168,10 +168,12 @@ app_license = "mit"
 scheduler_events = {
     "cron": {
         "0 * * * *": [  
-            "adrak_api.api.import_sales_invoices"
+            "adrak_api.api.import_sales_invoices",
+            "adrak_api.api.import_credit_notes"
         ]
     }
 }
+
 
 # Testing
 # -------
