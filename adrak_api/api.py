@@ -60,6 +60,11 @@ def address_exists_with_link(address_title, customer):
 
 ##sales Invoice
 
+
+import frappe
+import requests
+from frappe.utils import getdate
+
 @frappe.whitelist()
 def import_sales_invoices():
     frappe.set_user("Administrator")
@@ -83,15 +88,16 @@ def import_sales_invoices():
                 frappe.log_error("Missing Naming Series in payload", str(inv))
                 continue
 
-            if frappe.db.exists("Sales Invoice", invoice_name):
-                frappe.logger().info(f"⏩ Skipping duplicate invoice: {invoice_name}")
-                continue
-
             customer = inv.get("Customer Name")
             company = inv.get("Company Name")
             tax_id = inv.get("Tax ID")
+
             posting_date = getdate(inv.get("Posting Date"))
-            due_date = today()
+            posting_time = inv.get("Posting Time") or "00:00:00"
+            due_date = getdate(inv.get("Due Date")) if inv.get("Due Date") else posting_date
+            custom_measurement_date = getdate(inv.get("MEASUREMENTDATE")) if inv.get("MEASUREMENTDATE") else None
+            custom_annexure_ref_id = (inv.get("ANNEXUREREFID") or "").strip()
+
             address_title = inv.get("Customer Address")
             address_display = inv.get("Address Display")
             items = inv.get("Items", [])
@@ -122,23 +128,43 @@ def import_sales_invoices():
                     "tax_id": tax_id
                 }).insert(ignore_permissions=True)
 
-            if address_title and address_display and not address_exists_with_link(address_title, customer):
-                parsed = parse_address_display(address_display)
-                frappe.get_doc({
-                    "doctype": "Address",
-                    "address_title": address_title,
-                    "address_type": "Billing",
-                    "address_line1": parsed["address_line1"],
-                    "city": parsed["city"],
-                    "pincode": parsed["pincode"],
-                    "district": parsed["district"],
-                    "custom_building_number": parsed["custom_building_number"],
-                    "country": "Saudi Arabia",
-                    "links": [{
-                        "link_doctype": "Customer",
-                        "link_name": customer
-                    }]
-                }).insert(ignore_permissions=True)
+            project_name = inv.get("NAMEOFPROJECT")
+            commencement_date = inv.get("COMMENCEMENTDATE")
+            completion_date = inv.get("COMPLETIONDATE")
+            control_value_in_sar = inv.get("CONTROLVALUEINSAR")
+
+            project_link = None
+            if project_name:
+                project_link = frappe.db.get_value("Project", {"project_name": project_name}, "name")
+                if not project_link:
+                    project_doc = frappe.get_doc({
+                        "doctype": "Project",
+                        "project_name": project_name,
+                        "company": company,
+                        "expected_start_date": commencement_date,
+                        "expected_end_date": completion_date,
+                        "custom_control_value": control_value_in_sar,
+                        "status": "Open"
+                    })
+                    project_doc.insert(ignore_permissions=True)
+                    frappe.db.commit()
+                    project_link = project_doc.name
+                    frappe.logger().info(f"📁 Created new project: {project_doc.name}")
+                else:
+                    proj = frappe.get_doc("Project", project_link)
+                    updated = False
+                    if commencement_date and str(proj.expected_start_date) != str(commencement_date):
+                        proj.expected_start_date = commencement_date
+                        updated = True
+                    if completion_date and str(proj.expected_end_date) != str(completion_date):
+                        proj.expected_end_date = completion_date
+                        updated = True
+                    if control_value_in_sar and str(proj.custom_control_value) != str(control_value_in_sar):
+                        proj.custom_control_value = control_value_in_sar
+                        updated = True
+                    if updated:
+                        proj.save(ignore_permissions=True)
+                        frappe.logger().info(f"🛠️ Updated existing project: {proj.name}")
 
             invoice_items = []
             tax_account_map = {}
@@ -153,13 +179,10 @@ def import_sales_invoices():
                 tax_template = item.get("Item_Tax_Template")
 
                 if uom and not frappe.db.exists("UOM", uom):
-                    frappe.get_doc({
-                        "doctype": "UOM",
-                        "uom_name": uom
-                    }).insert(ignore_permissions=True)
+                    frappe.get_doc({"doctype": "UOM", "uom_name": uom}).insert(ignore_permissions=True)
 
                 if not frappe.db.exists("Item", item_code):
-                    item_doc = frappe.get_doc({
+                    frappe.get_doc({
                         "doctype": "Item",
                         "item_code": item_code,
                         "item_name": item_name,
@@ -168,19 +191,7 @@ def import_sales_invoices():
                         "is_sales_item": 1,
                         "item_group": "Services",
                         "is_stock_item": 0
-                    })
-
-                    tax_template_name = frappe.db.get_value(
-                        "Item Tax Template",
-                        {"name": tax_template, "company": company},
-                        "name"
-                    )
-                    if tax_template_name:
-                        item_doc.append("taxes", {
-                            "item_tax_template": tax_template_name
-                        })
-
-                    item_doc.insert(ignore_permissions=True)
+                    }).insert(ignore_permissions=True)
 
                 invoice_items.append({
                     "item_code": item_code,
@@ -211,10 +222,6 @@ def import_sales_invoices():
                                         "rate": tmpl_row.tax_rate,
                                         "description": f"From template {tax_template_name}"
                                     }
-                            else:
-                                frappe.log_error(
-                                    f"Tax account {tmpl_row.tax_type} skipped (belongs to {account_company}, not {company})"
-                                )
 
             if not tax_account_map:
                 default_tax_template = frappe.db.get_value(
@@ -231,40 +238,68 @@ def import_sales_invoices():
                             "rate": row.rate,
                             "description": f"From template {default_tax_template}"
                         }
-                else:
-                    frappe.log_error(
-                        f"No default Sales Taxes and Charges Template found for company {company}. Invoice {invoice_name} will likely fail."
-                    )
 
-            invoice_data = {
-                "doctype": "Sales Invoice",
-                "customer": customer,
-                "company": company,
-                "tax_id": tax_id,
-                "posting_date": posting_date,
-                "due_date": due_date,
-                "currency": currency,
-                "conversion_rate": 1,
-                "selling_price_list": None,
-                "ignore_pricing_rule": 1,
-                "debit_to": receivable_account,
-                "is_stock_item": 0,
-                "items": invoice_items,
-                "taxes": list(tax_account_map.values())
-            }
+            existing_invoice = frappe.db.exists("Sales Invoice", invoice_name)
 
-            doc = frappe.get_doc(invoice_data)
-            doc.insert(ignore_permissions=True, set_name=invoice_name)
-            frappe.logger().info(f"✅ Inserted draft invoice: {invoice_name}")
+            frappe.logger().info(
+                f"🔎 Invoice {invoice_name} — Measurement: {custom_measurement_date}, Annexure: {custom_annexure_ref_id}, Project: {project_link}"
+            )
 
-            frappe.db.commit()
+            if existing_invoice:
+                doc = frappe.get_doc("Sales Invoice", invoice_name)
+                doc.flags.ignore_permissions = True
+                doc.flags.ignore_mandatory = True
+                doc.flags.ignore_validate_update_after_submit = True
+
+                doc.update({
+                    "customer": customer,
+                    "company": company,
+                    "tax_id": tax_id,
+                    "posting_date": posting_date,
+                    "posting_time": posting_time,
+                    "set_posting_time": 1,
+                    "due_date": due_date,
+                    "project": project_link,
+                    "custom_measurement_date": custom_measurement_date,
+                    "custom_annexure_ref_id": custom_annexure_ref_id
+                })
+
+                doc.set("items", invoice_items)
+                doc.set("taxes", list(tax_account_map.values()))
+
+                doc.save(ignore_permissions=True)
+                frappe.db.commit()
+                frappe.logger().info(f"🔄 Updated existing invoice: {invoice_name}")
+
+            else:
+                doc = frappe.get_doc({
+                    "doctype": "Sales Invoice",
+                    "name": invoice_name,
+                    "customer": customer,
+                    "company": company,
+                    "tax_id": tax_id,
+                    "posting_date": posting_date,
+                    "posting_time": posting_time,
+                    "set_posting_time": 1,
+                    "due_date": due_date,
+                    "currency": currency,
+                    "conversion_rate": 1,
+                    "ignore_pricing_rule": 1,
+                    "debit_to": receivable_account,
+                    "is_stock_item": 0,
+                    "items": invoice_items,
+                    "taxes": list(tax_account_map.values()),
+                    "project": project_link,
+                    "custom_measurement_date": custom_measurement_date,
+                    "custom_annexure_ref_id": custom_annexure_ref_id
+                })
+                doc.insert(ignore_permissions=True)
+                frappe.db.commit()
+                frappe.logger().info(f"🆕 Inserted new draft invoice: {invoice_name}")
 
         except Exception:
             title = f"Import Error: {inv.get('Naming Series', '')[:20]} - {inv.get('Customer Name', '')[:40]}"
             frappe.log_error(title=title, message=frappe.get_traceback())
-
-
-
 
 ##Credit Note
 
